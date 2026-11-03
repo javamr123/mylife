@@ -7,7 +7,7 @@
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data: https://raw.githubusercontent.com https://avatars.githubusercontent.com; connect-src 'self' https://api.github.com https://raw.githubusercontent.com; base-uri 'none'; form-action 'self'; object-src 'none'">
   <meta name="theme-color" content="#100e0c">
-  <title>路书</title>
+  <title>我的生活纪律</title>
   <link rel="icon" href="favicon.svg">
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -16,16 +16,12 @@
   <div class="page">
     <header class="topbar">
       <a class="brand" href="#/">
-        <span class="seal" aria-hidden="true">记</span>
         <span>
-          <strong id="site-title">路书</strong>
+          <strong id="site-title">我的生活纪律</strong>
           <small id="site-sub">个人旅行记录</small>
-          <small id="site-author" hidden></small>
         </span>
       </a>
       <div class="top-actions">
-        <button type="button" class="pill" id="auth-pill" data-action="settings">只读</button>
-        <button type="button" class="btn ghost" data-action="settings">设置</button>
         <button type="button" class="btn solid" data-action="write">写日志</button>
       </div>
     </header>
@@ -41,6 +37,32 @@
     </div>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <div class="world-gate" aria-hidden="true">
+    <div class="gate-veil"></div>
+    <span class="gate-burst gate-anchor"></span>
+    <span class="gate-burst gate-anchor"></span>
+    <span class="gate-burst gate-anchor"></span>
+    <span class="gate-burst gate-anchor"></span>
+    <span class="gate-burst gate-anchor"></span>
+    <span class="gate-sweep gate-anchor"></span>
+    <div class="gate-flash gate-anchor"></div>
+    <div class="compass gate-compass">
+      <span class="compass-arc"></span>
+      <span class="compass-ticks"></span>
+      <span class="compass-ticks compass-ticks-rev"></span>
+      <span class="compass-ring"></span>
+      <span class="compass-ring inner"></span>
+      <span class="compass-orbit"><i></i></span>
+      <span class="compass-orbit compass-orbit-inner"><i></i></span>
+      <b class="cardinal n">北</b>
+      <b class="cardinal e">东</b>
+      <b class="cardinal s">南</b>
+      <b class="cardinal w">西</b>
+    </div>
+    <p class="gate-kicker">欢迎进入</p>
+    <span class="seal gate-seal">赵</span>
+    <p class="gate-title" id="gate-title">我的生活轨迹</p>
+  </div>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

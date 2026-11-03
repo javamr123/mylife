@@ -35,11 +35,13 @@ const GLOBE_VIEW = "lushu.globe.view";
 const globes = [];
 let pickControl = null;
 let cityModule = null;
+let earthCity = null;
+let earthCityStamp = 0;
 
 const state = {
   booted: false,
   loadError: "",
-  site: { title: "路书", subtitle: "个人旅行记录", author: "" },
+  site: { title: "我的生活纪律", subtitle: "个人旅行记录", author: "" },
   trips: [],
   source: "repo",
   contentSha: "",
@@ -55,6 +57,7 @@ const state = {
   editor: null,
   gate: "",
   publishing: false,
+  pendingDelete: "",
 };
 
 let expectedHash = null;
@@ -72,8 +75,13 @@ function parseRoute() {
   const hash = (location.hash || "#/").replace(/^#/, "");
   const parts = hash.split("/").filter(Boolean).map(safeDecode);
   if (parts[0] === "t" && parts[1]) return { name: "trip", id: parts[1] };
+  if (parts[0] === "c" && parts[1]) {
+    const point = coordPair(parts[2], parts[3]);
+    return { name: "city", id: parts[1].slice(0, 80), lat: point?.lat ?? null, lng: point?.lng ?? null };
+  }
   if (parts[0] === "write" && parts[1]) return { name: "write", id: parts[1] };
   if (parts[0] === "write") return { name: "write", id: "" };
+  if (parts[0] === "earth") return { name: "earth", id: "" };
   return { name: "home", id: "" };
 }
 
@@ -221,7 +229,7 @@ function parseSite(text) {
   try {
     const data = JSON.parse(text);
     return {
-      title: String(data.title || "路书").slice(0, 40),
+      title: String(data.title || "我的生活纪律").slice(0, 40),
       subtitle: String(data.subtitle || "个人旅行记录").slice(0, 60),
       author: String(data.author || "").slice(0, 40),
     };
@@ -258,7 +266,9 @@ function resolveSrc(path) {
 }
 
 async function onRoute() {
+  state.pendingDelete = "";
   const route = parseRoute();
+  const previous = state.route.name;
   const sameWrite = route.name === "write"
     && state.route.name === "write"
     && state.editor
@@ -276,6 +286,15 @@ async function onRoute() {
     revokeLocalPhotos();
     state.editor = null;
     state.gate = "";
+  }
+
+  if (route.name === "earth" && previous === "home" && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    document.body.classList.add("is-crossing");
+    window.clearTimeout(crossingTimer);
+    crossingTimer = window.setTimeout(() => {
+      document.body.classList.remove("is-crossing");
+      crossingTimer = 0;
+    }, 1000);
   }
 
   state.route = route;
@@ -308,6 +327,19 @@ async function onRoute() {
     } catch (error) {
       state.editor = null;
       state.view = { status: "error", error: friendlyError(error) };
+    }
+    render({ focus: true });
+    return;
+  }
+
+  if (route.name === "city") {
+    state.view = state.loadError
+      ? { status: "error", error: state.loadError }
+      : { status: "ready", error: "" };
+    try {
+      await ensureCities();
+    } catch {
+      // 城市名单没载入时，仍按地点名称列出日志。
     }
     render({ focus: true });
     return;
@@ -357,12 +389,16 @@ async function ensureTrip(id) {
     });
   }
   const coverFile = safeImageFile(meta.cover) || images.find((image) => image.cover)?.file || images[0]?.file || "";
+  const listed = state.trips.find((trip) => trip.id === id);
+  const spot = coordPair(meta.lat, meta.lng) || coordPair(listed?.lat, listed?.lng);
   const model = {
     id,
     title: String(meta.title || "未命名").slice(0, 80),
     date: dateOrEmpty(meta.date),
     endDate: dateOrEmpty(meta.endDate),
     place: String(meta.place || "").slice(0, 40),
+    lat: spot?.lat ?? null,
+    lng: spot?.lng ?? null,
     summary: String(meta.summary || "").slice(0, 160),
     body: bodyText,
     updated: typeof meta.updated === "string" ? meta.updated : "",
@@ -479,15 +515,15 @@ function render({ focus = false } = {}) {
   if (state.editor && document.getElementById("editor")) readEditorDom();
   destroyGlobes();
   document.title = documentTitle();
-  document.getElementById("site-title").textContent = state.site.title || "路书";
+  document.getElementById("site-title").textContent = state.site.title || "我的生活纪律";
   document.getElementById("site-sub").textContent = state.site.subtitle || "个人旅行记录";
-  const authorName = (state.site.author || "").trim();
-  const author = document.getElementById("site-author");
-  author.textContent = authorName;
-  author.hidden = !authorName;
   const description = document.querySelector('meta[name="description"]');
   if (description) description.content = state.site.subtitle || "个人旅行记录";
-  renderAuthPill();
+  const welcome = state.route.name === "home" && state.booted && state.view.status === "ready";
+  const earth = state.route.name === "earth" && state.booted && state.view.status === "ready";
+  document.body.classList.toggle("is-welcome", welcome);
+  document.body.classList.toggle("is-earth", earth);
+  syncArrival(welcome);
 
   const view = document.getElementById("view");
   const scrollY = window.scrollY;
@@ -497,17 +533,92 @@ function render({ focus = false } = {}) {
     mountPickGlobe();
   } else {
     view.innerHTML = mainHtml();
-    if (state.route.name === "home" && state.booted && state.view.status === "ready") mountHomeGlobe();
+    if (state.route.name === "earth" && state.booted && state.view.status === "ready") mountHomeGlobe();
   }
   if (focus) {
     window.scrollTo(0, 0);
     if (state.route.name === "write" && state.editor?.isNew) {
       view.querySelector("[data-field=title]")?.focus();
     } else {
-      view.focus();
+      view.focus({ preventScroll: true });
     }
   } else {
     window.scrollTo(0, scrollY);
+  }
+  if (document.body.classList.contains("is-gating")) alignGate();
+}
+
+let arrivedHome = false;
+let arrivalTimer = 0;
+let crossingTimer = 0;
+
+function syncArrival(welcome) {
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!welcome || reduce) {
+    arrivedHome = false;
+    window.clearTimeout(arrivalTimer);
+    arrivalTimer = 0;
+    document.body.classList.remove("is-arriving", "is-gating", "is-settled");
+    return;
+  }
+  if (arrivedHome) return;
+  arrivedHome = true;
+  document.body.classList.remove("is-settled");
+  document.body.classList.add("is-arriving", "is-gating");
+  arrivalTimer = window.setTimeout(() => {
+    document.body.classList.remove("is-gating");
+    document.body.classList.add("is-settled");
+    arrivalTimer = 0;
+  }, 3900);
+}
+
+function alignGate() {
+  const compass = document.querySelector(".welcome .compass");
+  const title = document.querySelector(".welcome-core h1");
+  const seal = document.querySelector(".seal-welcome");
+  const gateCompass = document.querySelector(".gate-compass");
+  const gateTitle = document.getElementById("gate-title");
+  const gateSeal = document.querySelector(".gate-seal");
+  const gateKicker = document.querySelector(".gate-kicker");
+  if (!compass || !gateCompass) return;
+  const box = compass.getBoundingClientRect();
+  if (box.width < 8) return;
+  const cx = box.left + box.width / 2;
+  const cy = box.top + box.height / 2;
+  gateCompass.style.left = `${cx}px`;
+  gateCompass.style.top = `${cy}px`;
+  gateCompass.style.width = `${box.width}px`;
+  const veil = document.querySelector(".gate-veil");
+  if (veil) {
+    veil.style.setProperty("--iris-x", `${cx}px`);
+    veil.style.setProperty("--iris-y", `${cy}px`);
+  }
+  document.querySelectorAll(".gate-anchor").forEach((node) => {
+    node.style.left = `${cx}px`;
+    node.style.top = `${cy}px`;
+  });
+  if (title && gateTitle) {
+    const titleBox = title.getBoundingClientRect();
+    const style = getComputedStyle(title);
+    gateTitle.textContent = title.textContent || "";
+    gateTitle.style.left = `${titleBox.left + titleBox.width / 2}px`;
+    gateTitle.style.top = `${titleBox.top + titleBox.height / 2}px`;
+    gateTitle.style.fontSize = style.fontSize;
+    gateTitle.style.lineHeight = style.lineHeight;
+    gateTitle.style.setProperty("--gate-track", style.letterSpacing);
+    if (gateKicker) {
+      gateKicker.style.left = `${titleBox.left + titleBox.width / 2}px`;
+      gateKicker.style.top = `${titleBox.top}px`;
+    }
+  }
+  if (seal && gateSeal) {
+    const sealBox = seal.getBoundingClientRect();
+    const style = getComputedStyle(seal);
+    gateSeal.style.left = `${sealBox.left + sealBox.width / 2}px`;
+    gateSeal.style.top = `${sealBox.top + sealBox.height / 2}px`;
+    gateSeal.style.width = style.width;
+    gateSeal.style.height = style.height;
+    gateSeal.style.fontSize = style.fontSize;
   }
 }
 
@@ -516,25 +627,145 @@ function documentTitle() {
     const trip = state.tripCache.get(state.route.id);
     if (trip) return `${trip.title} · ${state.site.title}`;
   }
+  if (state.route.name === "city") return `${state.route.id} · ${state.site.title}`;
+  if (state.route.name === "earth") return `地球 · ${state.site.title}`;
   if (state.route.name === "write") return `写日志 · ${state.site.title}`;
-  return state.site.title || "路书";
-}
-
-function renderAuthPill() {
-  const pill = document.getElementById("auth-pill");
-  const writing = Boolean(state.auth?.canPush);
-  pill.hidden = !writing;
-  pill.textContent = writing ? "可写" : "";
+  return state.site.title || "我的生活纪律";
 }
 
 function mainHtml() {
   if (!state.booted || state.view.status === "loading") return `<p class="status">正在读取…</p>`;
   if (state.view.status === "error") return emptyHtml("没有读到", state.view.error);
   if (state.route.name === "trip") return tripHtml();
-  return homeHtml();
+  if (state.route.name === "city") return cityHtml();
+  if (state.route.name === "earth") return earthHtml();
+  return welcomeHtml();
 }
 
-function homeHtml() {
+function welcomeHtml() {
+  const title = state.site.title || "我的生活纪律";
+  const subtitle = state.site.subtitle || "个人旅行记录";
+  const author = (state.site.author || "").trim();
+  const trips = state.trips;
+  const places = placeNames(trips);
+  const dated = trips.map((trip) => trip.date).filter((date) => /^\d{4}/.test(date || "")).sort();
+  const year = dated.length ? ceremonialDigits(dated[dated.length - 1].slice(0, 4)) : "—";
+  const latest = [...trips].sort(sortTrips)[0];
+  const placesHtml = places.length
+    ? `<p class="welcome-places">${places.map((name) => esc(name)).join("<span>·</span>")}</p>`
+    : "";
+  const enter = trips.length
+    ? `<a class="welcome-enter" href="#/earth">启程</a><p class="welcome-whisper">进入地球，点开一座城</p>`
+    : `<button type="button" class="welcome-enter" data-action="write">写下第一篇</button><p class="welcome-whisper"><a href="#/earth">先看地球</a></p>`;
+  return `${draftBanner()}<section class="welcome" aria-label="欢迎">
+    <div class="welcome-sky" aria-hidden="true">
+      <div class="welcome-bloom"></div>
+      <div class="compass">
+        <span class="compass-arc"></span>
+        <span class="compass-ticks"></span>
+        <span class="compass-ticks compass-ticks-rev"></span>
+        <span class="compass-ring"></span>
+        <span class="compass-ring inner"></span>
+        <span class="compass-orbit"><i></i></span>
+        <span class="compass-orbit compass-orbit-inner"><i></i></span>
+        <b class="cardinal n">北</b>
+        <b class="cardinal e">东</b>
+        <b class="cardinal s">南</b>
+        <b class="cardinal w">西</b>
+      </div>
+      <svg class="welcome-grain" viewBox="0 0 200 200" preserveAspectRatio="none">
+        <filter id="welcome-grain">
+          <feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="4" stitchTiles="stitch"></feTurbulence>
+        </filter>
+        <rect width="100%" height="100%" filter="url(#welcome-grain)"></rect>
+      </svg>
+    </div>
+    <div class="welcome-frame" aria-hidden="true">
+      <span class="corner tl"></span>
+      <span class="corner tr"></span>
+      <span class="corner bl"></span>
+      <span class="corner br"></span>
+    </div>
+    <p class="welcome-vert welcome-vert-left">山河入册</p>
+    <p class="welcome-vert welcome-vert-right">岁月可回</p>
+    <div class="welcome-core">
+      <p class="welcome-date"><i></i>${esc(welcomeDate())}</p>
+      <h1>${esc(title)}</h1>
+      <div class="welcome-seal-row" aria-hidden="true">
+        <span class="hair"></span>
+        <span class="seal seal-welcome">赵</span>
+        <span class="hair"></span>
+      </div>
+      <p class="welcome-sub">${esc(subtitle)}</p>
+      ${author ? `<p class="welcome-author">${esc(author)}</p>` : ""}
+      <p class="welcome-epigraph">此一册，只记走过的路。</p>
+      <ul class="welcome-stats">
+        <li><strong>${esc(countGlyph(places.length))}</strong><span>城</span></li>
+        <li><strong>${esc(countGlyph(trips.length))}</strong><span>篇</span></li>
+        <li><strong>${esc(year)}</strong><span>岁纪</span></li>
+      </ul>
+      ${placesHtml}
+      ${enter}
+      ${latest ? welcomeLatest(latest) : ""}
+    </div>
+  </section>`;
+}
+
+function welcomeLatest(trip) {
+  const mark = trip.coverSrc
+    ? `<img src="${esc(trip.coverSrc)}" alt="" referrerpolicy="no-referrer">`
+    : "";
+  const meta = metaLine(trip);
+  return `<a class="welcome-latest${mark ? " has-thumb" : ""}" href="#/t/${esc(trip.id)}">
+    ${mark}
+    <span class="welcome-latest-copy">
+      <span class="kicker">最近一篇</span>
+      <strong>${esc(trip.title || "未命名")}</strong>
+      ${meta ? `<em>${esc(meta)}</em>` : ""}
+      ${trip.summary ? `<small>${esc(trip.summary)}</small>` : ""}
+    </span>
+  </a>`;
+}
+
+function placeNames(trips) {
+  const names = [];
+  for (const trip of [...trips].sort(sortTrips)) {
+    const name = String(trip.place || "").trim();
+    if (!name || names.includes(name)) continue;
+    names.push(name);
+    if (names.length === 8) break;
+  }
+  return names;
+}
+
+function countGlyph(count) {
+  if (count > 9) return String(count);
+  return "〇一二三四五六七八九"[count] || "〇";
+}
+
+function ceremonialDigits(value) {
+  const map = "〇一二三四五六七八九";
+  return String(value).replace(/\d/g, (digit) => map[Number(digit)] || digit);
+}
+
+function welcomeDate() {
+  const now = new Date();
+  const week = "日一二三四五六"[now.getDay()];
+  const months = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二"];
+  return `${ceremonialDigits(now.getFullYear())}年${months[now.getMonth()]}月${ceremonialDay(now.getDate())}日 · 星期${week}`;
+}
+
+function ceremonialDay(day) {
+  const n = "〇一二三四五六七八九";
+  if (day <= 10) return day === 10 ? "十" : n[day];
+  if (day < 20) return `十${n[day % 10]}`;
+  if (day === 20) return "二十";
+  if (day < 30) return `二十${n[day % 10]}`;
+  if (day === 30) return "三十";
+  return `三十${n[day % 10]}`;
+}
+
+function earthHtml() {
   const banner = draftBanner();
   const landed = landedTrips();
   const loose = state.trips.filter((trip) => !coordPair(trip.lat, trip.lng));
@@ -545,9 +776,35 @@ function homeHtml() {
     ? `<nav class="sr-only" aria-label="全部记录">${state.trips.map((trip) => `<a href="#/t/${esc(trip.id)}">${esc(trip.title)}</a>`).join("")}</nav>`
     : "";
   const caption = landed.length ? "" : `<h1>还没有落下第一站</h1>`;
-  return `${banner}<section class="globe-home">
+  const logs = earthCity
+    ? cityLogMarkup(earthCity, "h2")
+    : (landed.length ? `<p class="hint">点一座城市，在这里看它的日志。</p>` : "");
+  return `${banner}<section class="globe-home${earthCity ? " has-city" : ""}">
+    <div class="earth-sky" aria-hidden="true">
+      <div class="compass earth-compass">
+        <span class="compass-arc"></span>
+        <span class="compass-ticks"></span>
+        <span class="compass-ticks compass-ticks-rev"></span>
+        <span class="compass-ring"></span>
+        <span class="compass-ring inner"></span>
+        <b class="cardinal n">北</b>
+        <b class="cardinal e">东</b>
+        <b class="cardinal s">南</b>
+        <b class="cardinal w">西</b>
+      </div>
+    </div>
+    <div class="welcome-frame" aria-hidden="true">
+      <span class="corner tl"></span>
+      <span class="corner tr"></span>
+      <span class="corner bl"></span>
+      <span class="corner br"></span>
+    </div>
+    <p class="welcome-vert welcome-vert-left">山河入册</p>
+    <p class="welcome-vert welcome-vert-right">岁月可回</p>
+    <p class="earth-kicker"><i></i>地球</p>
     <canvas id="globe" aria-label="旅行过的地球"></canvas>
-    <div id="globe-caption" class="globe-caption">${caption}</div>
+    <div id="globe-caption" class="globe-caption">${earthCity ? "" : caption}</div>
+    <section id="earth-logs" class="earth-logs city-log" aria-live="polite">${logs}</section>
     ${looseHtml}
     ${index}
   </section>`;
@@ -557,12 +814,176 @@ function landedTrips() {
   return state.trips
     .filter((trip) => coordPair(trip.lat, trip.lng))
     .map((trip) => ({ ...trip, ...coordPair(trip.lat, trip.lng) }))
-    .sort((a, b) => (a.date === b.date ? (a.id < b.id ? -1 : 1) : (a.date < b.date ? -1 : 1)));
+    .sort((a, b) => {
+      if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+      const updated = String(a.updated || "");
+      const other = String(b.updated || "");
+      if (updated !== other) return updated < other ? -1 : 1;
+      return a.id < b.id ? -1 : 1;
+    });
+}
+
+function cityHash(city) {
+  const name = encodeURIComponent(String(city?.name || "").slice(0, 80));
+  if (!name) return "#/";
+  const lat = Number(city.lat);
+  const lng = Number(city.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return `#/c/${name}`;
+  return `#/c/${name}/${lat.toFixed(4)}/${lng.toFixed(4)}`;
+}
+
+function cityKm(lat, lng, otherLat, otherLng) {
+  const rad = Math.PI / 180;
+  const dLat = (otherLat - lat) * rad;
+  const dLng = (otherLng - lng) * rad * Math.cos(((lat + otherLat) / 2) * rad);
+  return Math.hypot(dLat, dLng) * 6371;
+}
+
+function sameCityPoint(city, route) {
+  return route.lat != null && Math.abs(city[3] - route.lat) < 0.05 && Math.abs(city[4] - route.lng) < 0.05;
+}
+
+function tripsForCity(route) {
+  const name = String(route.id || "").slice(0, 40);
+  return state.trips.filter((trip) => tripBelongsToCity(trip, name, route)).sort(sortTrips);
+}
+
+function tripBelongsToCity(trip, name, route) {
+  const spot = coordPair(trip.lat, trip.lng);
+  if (spot && route.lat != null && cityKm(spot.lat, spot.lng, route.lat, route.lng) < 1) return true;
+  if (landedOnCity(trip, route)) return true;
+  if (trip.place !== name) return false;
+  return !assignedElsewhere(trip, name, route);
+}
+
+function landedOnCity(trip, route) {
+  if (!cityModule || route.lat == null) return false;
+  const spot = coordPair(trip.lat, trip.lng);
+  if (!spot) return false;
+  const near = cityModule.nearestCity(spot.lat, spot.lng);
+  if (!near || !sameCityPoint(near, route)) return false;
+  return cityKm(spot.lat, spot.lng, near[3], near[4]) <= 80;
+}
+
+function assignedElsewhere(trip, name, route) {
+  if (!cityModule || route.lat == null || trip.place !== name) return false;
+  const spot = coordPair(trip.lat, trip.lng);
+  if (!spot) return false;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const city of cityModule.cities) {
+    if (city[0] !== name) continue;
+    const distance = cityKm(spot.lat, spot.lng, city[3], city[4]);
+    if (distance < bestDistance) {
+      best = city;
+      bestDistance = distance;
+    }
+  }
+  return Boolean(best) && !sameCityPoint(best, route);
+}
+
+function cityCountry(route) {
+  if (!cityModule || route.lat == null) return "";
+  const near = cityModule.nearestCity(route.lat, route.lng);
+  if (!near || near[0] !== route.id || !sameCityPoint(near, route)) return "";
+  return near[2] || "";
+}
+
+function directoryHref(trip) {
+  const spot = coordPair(trip.lat, trip.lng);
+  const name = String(trip.place || "").trim() || "未写地点";
+  return cityHash({ name, lat: spot?.lat, lng: spot?.lng });
+}
+
+function cityHtml() {
+  return `<article class="article city-log">
+    <div class="article-top">
+      <a class="back" href="#/earth">← 回到地球</a>
+    </div>
+    ${cityLogMarkup(state.route)}
+  </article>`;
+}
+
+function cityLogMarkup(route, heading = "h1") {
+  const tag = heading === "h2" ? "h2" : "h1";
+  const name = route.id;
+  const country = cityCountry(route);
+  const trips = tripsForCity(route);
+  const list = trips.length
+    ? `<nav class="trip-list" aria-label="${esc(name)}的日志">${trips.map(tripRow).join("")}</nav>`
+    : "";
+  const count = trips.length
+    ? `<p class="lede">${trips.length} 篇</p>${list}`
+    : `<p class="lede">这里还没有日志。</p>`;
+  return `${country ? `<p class="kicker">${esc(country)}</p>` : ""}
+    <${tag}>${esc(name)}的日志</${tag}>
+    ${count}`;
+}
+
+function cityRouteFromTrip(trip) {
+  const spot = coordPair(trip.lat, trip.lng);
+  return {
+    id: String(trip.place || "").trim() || trip.title || "未写地点",
+    lat: spot?.lat ?? null,
+    lng: spot?.lng ?? null,
+  };
+}
+
+async function showEarthCity(id) {
+  const trip = state.trips.find((item) => item.id === id);
+  if (!trip || state.route.name !== "earth") return;
+  const stamp = ++earthCityStamp;
+  const route = cityRouteFromTrip(trip);
+  try {
+    await ensureCities();
+  } catch {
+    // 城市名单没载入时，仍按地点名称列出日志。
+  }
+  if (stamp !== earthCityStamp || state.route.name !== "earth") return;
+  earthCity = route;
+  const home = document.querySelector(".globe-home");
+  const panel = document.getElementById("earth-logs");
+  const caption = document.getElementById("globe-caption");
+  if (!panel) return;
+  home?.classList.add("has-city");
+  if (caption) {
+    caption.dataset.state = "directory";
+    caption.dataset.id = "";
+    caption.innerHTML = "";
+  }
+  panel.innerHTML = cityLogMarkup(route, "h2");
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function deleteLogButton(trip) {
+  if (!state.auth?.canPush) return "";
+  const confirming = state.pendingDelete === trip.id;
+  const label = confirming ? "确认删除？" : "删除";
+  const name = confirming ? `确认删除${trip.title}` : `删除${trip.title}`;
+  return `<button type="button" class="btn danger trip-delete" data-action="delete-log" data-id="${esc(trip.id)}" aria-label="${esc(name)}">${label}</button>`;
+}
+
+function tripRow(trip) {
+  const when = formatRange(trip.date, trip.endDate) || "未写日期";
+  const thumb = trip.coverSrc
+    ? `<img src="${esc(trip.coverSrc)}" alt="" referrerpolicy="no-referrer">`
+    : "";
+  return `<div class="trip-row${thumb ? " has-thumb" : ""}">
+    <a class="trip-link" href="#/t/${esc(trip.id)}">
+      <time datetime="${esc(trip.date || "")}">${esc(when)}</time>
+      <span class="copy">
+        <strong>${esc(trip.title)}</strong>
+        ${trip.summary ? `<small>${esc(trip.summary)}</small>` : ""}
+      </span>
+      ${thumb}
+    </a>
+    ${deleteLogButton(trip)}
+  </div>`;
 }
 
 function paintCaption(marker) {
   const caption = document.getElementById("globe-caption");
-  if (!caption) return;
+  if (!caption || earthCity) return;
   if (!landedTrips().length) {
     if (caption.dataset.state === "empty") return;
     caption.dataset.state = "empty";
@@ -582,11 +1003,12 @@ function paintCaption(marker) {
   if (!trip) return;
   caption.dataset.state = "trip";
   caption.dataset.id = trip.id;
-  caption.innerHTML = `<a href="#/t/${esc(trip.id)}">
+  const peers = state.trips.filter((item) => item.place && item.place === trip.place);
+  caption.innerHTML = `<button type="button" class="caption-open" data-action="earth-city" data-id="${esc(trip.id)}">
     <p class="kicker">${esc(metaLine(trip))}</p>
-    <h1>${esc(trip.title)}</h1>
-    ${trip.summary ? `<p class="summary">${esc(trip.summary)}</p>` : ""}
-  </a>`;
+    <h1>${esc(trip.place || trip.title)}的日志</h1>
+    <p class="summary">${peers.length} 篇</p>
+  </button>`;
 }
 
 function mountHomeGlobe() {
@@ -597,7 +1019,7 @@ function mountHomeGlobe() {
     markers: landedTrips(),
     view: readGlobeView(),
     reducedMotion: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
-    onSelect: (id) => go(`#/t/${id}`),
+    onSelect: (id) => showEarthCity(id),
     onFront: paintCaption,
     onView: writeGlobeView,
   }));
@@ -698,6 +1120,9 @@ function writeGlobeView(view) {
       spin: view.spin,
       tilt: view.tilt,
       held: Boolean(view.held),
+      zoom: Number.isFinite(view.zoom) ? view.zoom : 1,
+      panX: Number.isFinite(view.panX) ? view.panX : 0,
+      panY: Number.isFinite(view.panY) ? view.panY : 0,
     }));
   } catch {
     // 隐私模式可能写不进这次转动。
@@ -730,11 +1155,13 @@ function storedTrip(trip) {
 function tripHtml() {
   const trip = state.tripCache.get(state.route.id);
   if (!trip) return emptyHtml("找不到这篇", "它可能还没发布，或编号不对。");
-  const edit = state.auth?.canPush ? `<a class="btn ghost" href="#/write/${esc(trip.id)}">修改</a>` : "";
+  const edit = state.auth?.canPush
+    ? `<div class="article-actions"><a class="btn ghost" href="#/write/${esc(trip.id)}">修改</a>${deleteLogButton(trip)}</div>`
+    : "";
   const stamp = formatStamp(trip.updated);
   return `<article class="article">
     <div class="article-top">
-      <a class="back" href="#/">← 回到地球</a>
+      <a class="back" href="#/earth">← 回到地球</a>
       ${edit}
     </div>
     ${articleHtml(trip)}
@@ -743,14 +1170,13 @@ function tripHtml() {
 }
 
 function articleHtml(model) {
-  const meta = metaLine(model);
   const cover = model.coverSrc
     ? `<img class="cover" src="${esc(model.coverSrc)}" alt="" referrerpolicy="no-referrer">`
     : "";
   const prose = String(model.body || "").trim()
     ? `<div class="prose">${renderMarkdown(model.body, resolverFor(model.images))}</div>`
     : `<p class="hint">这一篇是照片。</p>`;
-  return `<p class="kicker">${esc(meta)}</p>
+  return `<p class="kicker">${kickerHtml(model)}</p>
     <h1>${esc(model.title || "未命名")}</h1>
     ${model.summary ? `<p class="lede">${esc(model.summary)}</p>` : ""}
     ${cover}
@@ -796,10 +1222,19 @@ function metaLine(model) {
   return [when, model.place].filter(Boolean).join(" · ");
 }
 
+function kickerHtml(model) {
+  const when = formatRange(model.date, model.endDate);
+  const place = String(model.place || "").trim();
+  const parts = [];
+  if (when) parts.push(esc(when));
+  if (place) parts.push(`<a href="${esc(directoryHref(model))}">${esc(place)}</a>`);
+  return parts.join(" · ");
+}
+
 function emptyHtml(title, copy, action = false) {
   const button = action ? `<p><button type="button" class="btn solid" data-action="write">写第一篇</button></p>` : "";
   return `<section class="empty">
-    <p class="seal-large" aria-hidden="true">记</p>
+    <p class="seal-large" aria-hidden="true">赵</p>
     <h1>${esc(title)}</h1>
     <p>${esc(copy)}</p>
     ${button}
@@ -822,7 +1257,7 @@ function draftBanner() {
 function editorHtml() {
   if (state.gate === "edit") {
     return `<section class="gate">
-      <p class="seal-large" aria-hidden="true">记</p>
+      <p class="seal-large" aria-hidden="true">赵</p>
       <h1>还不能修改</h1>
       <p>先在设置里连上，才能改这篇。</p>
       <p><button type="button" class="btn solid" data-action="settings">打开设置</button></p>
@@ -921,6 +1356,8 @@ function modelFromEditor(editor) {
     date: editor.date,
     endDate: editor.endDate,
     place: editor.place,
+    lat: editor.lat,
+    lng: editor.lng,
     summary: plainSummary(editor.body, editor.summary),
     body: editor.body,
     images,
@@ -1260,6 +1697,35 @@ async function publish() {
   }
 }
 
+async function removePublishedTrip(id) {
+  assertId(id);
+  const github = client();
+  const ref = await contentRef(github);
+  const indexFile = await github.getTextFile("content/index.json", ref.branch);
+  const trips = (indexFile ? parseIndex(indexFile.text) : []).filter((trip) => trip.id !== id).map(storedTrip);
+  const head = await github.head(ref.branch);
+  const paths = await github.listBlobPaths(head.treeSha);
+  const prefix = `content/trips/${id}/`;
+  const deletions = paths.filter((path) => path.startsWith(prefix));
+  await github.commit({
+    branch: CONTENT_BRANCH,
+    message: `删除记录 ${id}`.slice(0, 72),
+    textFiles: [{ path: "content/index.json", text: `${JSON.stringify({ trips }, null, 2)}\n` }],
+    binaries: [],
+    deletions,
+    onProgress: () => openProgress("正在删除…"),
+  });
+  const draft = loadDraft();
+  if (draft?.id === id) clearDraft();
+  state.tripCache.delete(id);
+  forgetGlobeView();
+  try {
+    await readAllFromApi(github);
+  } catch {
+    state.trips = state.trips.filter((trip) => trip.id !== id);
+  }
+}
+
 async function deleteTrip() {
   const editor = state.editor;
   if (!editor?.id || state.publishing) return;
@@ -1277,40 +1743,61 @@ async function deleteTrip() {
   state.publishing = true;
   openProgress("正在删除…");
   try {
-    const github = client();
-    const ref = await contentRef(github);
-    const indexFile = await github.getTextFile("content/index.json", ref.branch);
-    const trips = (indexFile ? parseIndex(indexFile.text) : []).filter((trip) => trip.id !== id).map(storedTrip);
-    const head = await github.head(ref.branch);
-    const paths = await github.listBlobPaths(head.treeSha);
-    const deletions = paths.filter((path) => path.startsWith(`content/trips/${id}/`));
-    await github.commit({
-      branch: CONTENT_BRANCH,
-      message: `删除记录 ${id}`.slice(0, 72),
-      textFiles: [{ path: "content/index.json", text: `${JSON.stringify({ trips }, null, 2)}\n` }],
-      binaries: [],
-      deletions,
-      onProgress: () => openProgress("正在删除…"),
-    });
+    await removePublishedTrip(id);
     editor.dirty = false;
     revokeLocalPhotos();
     state.editor = null;
-    forgetGlobeView();
-    const draft = loadDraft();
-    if (draft?.id === id) clearDraft();
-    try {
-      await readAllFromApi(github);
-    } catch {
-      state.trips = state.trips.filter((trip) => trip.id !== id);
-    }
     closeProgress();
     toast("这篇已删除。");
     go("#/");
   } catch (error) {
     closeProgress();
-    editor.errors = [friendlyError(error)];
-    editor.confirmDelete = false;
+    if (state.editor) {
+      state.editor.errors = [friendlyError(error)];
+      state.editor.confirmDelete = false;
+      render();
+    } else {
+      toast(friendlyError(error));
+    }
+  } finally {
+    state.publishing = false;
+  }
+}
+
+async function deleteLog(id) {
+  if (state.publishing) return;
+  let safeId = "";
+  try {
+    safeId = assertId(id);
+  } catch (error) {
+    toast(friendlyError(error));
+    return;
+  }
+  if (!state.auth?.canPush) {
+    openSettings();
+    toast("删除需要一枚能写入这座仓库的令牌。");
+    return;
+  }
+  if (state.pendingDelete !== safeId) {
+    state.pendingDelete = safeId;
     render();
+    return;
+  }
+  const listed = state.trips.find((trip) => trip.id === safeId) || state.tripCache.get(safeId);
+  const back = listed ? directoryHref(listed) : "#/earth";
+  const onThisTrip = state.route.name === "trip" && state.route.id === safeId;
+  state.pendingDelete = "";
+  state.publishing = true;
+  openProgress("正在删除…");
+  try {
+    await removePublishedTrip(safeId);
+    closeProgress();
+    toast("这篇已删除。");
+    if (onThisTrip) go(back);
+    else render();
+  } catch (error) {
+    closeProgress();
+    toast(friendlyError(error));
   } finally {
     state.publishing = false;
   }
@@ -1545,7 +2032,7 @@ async function saveSiteFromDialog() {
   if (!state.auth?.canPush || state.publishing) return;
   const dialog = document.getElementById("settings-dialog");
   const site = {
-    title: dialog.querySelector("[name=title]").value.trim() || "路书",
+    title: dialog.querySelector("[name=title]").value.trim() || "我的生活纪律",
     subtitle: dialog.querySelector("[name=subtitle]").value.trim() || "个人旅行记录",
     author: dialog.querySelector("[name=author]").value.trim(),
   };
@@ -1660,6 +2147,10 @@ function onClick(event) {
   if (action === "settings") openSettings();
   if (action === "close-settings") document.getElementById("settings-dialog").close();
   if (action === "write") go("#/write");
+  if (action === "earth-city") {
+    showEarthCity(button.dataset.id);
+    return;
+  }
   if (action === "toggle-token") {
     const input = document.querySelector("[name=token]");
     if (!input) return;
@@ -1676,6 +2167,10 @@ function onClick(event) {
   if (action === "discard-draft") {
     clearDraft();
     render();
+  }
+  if (action === "delete-log") {
+    deleteLog(button.dataset.id);
+    return;
   }
   if (!state.editor) return;
   if (action === "preview") {
@@ -1718,6 +2213,10 @@ document.getElementById("progress-dialog").addEventListener("cancel", (event) =>
 });
 
 document.addEventListener("click", onClick);
+
+window.addEventListener("resize", () => {
+  if (document.body.classList.contains("is-gating")) alignGate();
+});
 
 window.addEventListener("hashchange", () => {
   const current = location.hash || "#/";
