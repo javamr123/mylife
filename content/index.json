@@ -1,0 +1,16 @@
+{
+  "trips": [
+    {
+      "id": "2026-11-03",
+      "title": "第一篇日志",
+      "date": "2026-11-03",
+      "endDate": "",
+      "place": "广州",
+      "summary": "这时第一篇",
+      "cover": "content/trips/2026-11-03/images/photo-01.jpg",
+      "updated": "2026-11-03T09:49:13.004Z",
+      "lat": 23.1167,
+      "lng": 113.25
+    }
+  ]
+}
