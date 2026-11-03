@@ -1,16 +1,3 @@
 {
-  "trips": [
-    {
-      "id": "2026-11-03-2",
-      "title": "我的第二篇",
-      "date": "2026-11-03",
-      "endDate": "",
-      "place": "北京",
-      "summary": "我的第二篇",
-      "cover": "content/trips/2026-11-03-2/images/photo-01.jpg",
-      "updated": "2026-11-03T10:22:07.967Z",
-      "lat": 39.9075,
-      "lng": 116.3972
-    }
-  ]
+  "trips": []
 }
